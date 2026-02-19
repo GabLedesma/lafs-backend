@@ -159,6 +159,45 @@ exports.createEventDoc = functions.https.onRequest(async (req, res) => {
 });
 
 // ===============================
+// 🎟️ Gender Availability Logic
+// ===============================
+
+const GENDER_TOLERANCE = 0.15; // male/female can't exceed 65% of total sales
+
+/**
+ * Computes whether male and female tickets are available based on
+ * current gender ratio. Returns availability booleans and current ratios.
+ *
+ * @param {number} maleSold
+ * @param {number} femaleSold
+ * @param {number} totalCapacity
+ * @param {number} tolerance
+ * @return {{ maleAvailable: boolean, femaleAvailable: boolean, maleRatio: number|null, femaleRatio: number|null }}
+ */
+function computeGenderAvailability(maleSold, femaleSold, totalCapacity, tolerance = GENDER_TOLERANCE) {
+  const totalSold = maleSold + femaleSold;
+
+  if (totalSold >= totalCapacity) {
+    return {maleAvailable: false, femaleAvailable: false, maleRatio: null, femaleRatio: null};
+  }
+
+  if (totalSold === 0) {
+    return {maleAvailable: true, femaleAvailable: true, maleRatio: 0, femaleRatio: 0};
+  }
+
+  const maleRatio = maleSold / totalSold;
+  const femaleRatio = femaleSold / totalSold;
+  const threshold = 0.5 + tolerance;
+
+  return {
+    maleAvailable: maleRatio <= threshold,
+    femaleAvailable: femaleRatio <= threshold,
+    maleRatio,
+    femaleRatio,
+  };
+}
+
+// ===============================
 // 🔹 Get Event Details (with CORS + Firestore fetch)
 // ===============================
 const detailsApp = express();
@@ -185,11 +224,20 @@ detailsApp.get("/", async (req, res) => {
     const priceDoc = await eventRef.collection("prices").doc(priceId).get();
     const priceData = priceDoc.exists ? priceDoc.data() : null;
 
+    const data = eventDoc.data();
+    const maleSold = (data.ticketsSold && data.ticketsSold.male) || 0;
+    const femaleSold = (data.ticketsSold && data.ticketsSold.female) || 0;
+    const totalCapacity =
+      ((data.ticketPerGender && data.ticketPerGender.male) || 0) +
+      ((data.ticketPerGender && data.ticketPerGender.female) || 0);
+
+    const availability = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
 
     return res.status(200).json({
       success: true,
-      event: eventDoc.data(),
+      event: data,
       price: priceData || null,
+      availability,
     });
   } catch (err) {
     console.error("🔥 Error fetching event details:", err);
@@ -1131,13 +1179,14 @@ exports.blinkWebhook = functions.https.onRequest(async (req, res) => {
       } else {
         const latest = eventSnap.data();
 
-        const maleRemaining =
-          ((latest.ticketPerGender && latest.ticketPerGender.male) || 0) -
-          ((latest.ticketsSold && latest.ticketsSold.male) || 0);
+        const maleSold = (latest.ticketsSold && latest.ticketsSold.male) || 0;
+        const femaleSold = (latest.ticketsSold && latest.ticketsSold.female) || 0;
+        const maleCapacity = (latest.ticketPerGender && latest.ticketPerGender.male) || 0;
+        const femaleCapacity = (latest.ticketPerGender && latest.ticketPerGender.female) || 0;
+        const totalCapacity = maleCapacity + femaleCapacity;
 
-        const femaleRemaining =
-          ((latest.ticketPerGender && latest.ticketPerGender.female) || 0) -
-          ((latest.ticketsSold && latest.ticketsSold.female) || 0);
+        const maleRemaining = maleCapacity - maleSold;
+        const femaleRemaining = femaleCapacity - femaleSold;
 
         console.log("🎟️ Remaining:", {maleRemaining, femaleRemaining});
 
@@ -1147,57 +1196,19 @@ exports.blinkWebhook = functions.https.onRequest(async (req, res) => {
           return;
         }
 
-        let fieldData = {};
+        const {maleAvailable, femaleAvailable} = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
 
-        const genderLower = (gender || "").toLowerCase();
+        const maleUnavailable = maleRemaining <= 0 || !maleAvailable;
+        const femaleUnavailable = femaleRemaining <= 0 || !femaleAvailable;
 
-        // ======================================================
-        // 👨 MALE STATUS
-        // ======================================================
-        if (genderLower === "male") {
-          if (maleRemaining <= 0) {
-            console.log("🟥 Male SOLD OUT");
+        console.log("🎟️ Availability:", {maleUnavailable, femaleUnavailable});
 
-            fieldData = {
-              maleicontext: "SOLD OUT!",
-              maletextcolor: "#fc0202",
-            };
-          } else if (maleRemaining <= 3) {
-            console.log("🟥 Male LAST FEW REMAINING");
-
-            fieldData = {
-              maleicontext: "Last Few Remaining!",
-              maletextcolor: "#fc0202",
-            };
-          }
-        }
-
-        // ======================================================
-        // 👩 FEMALE STATUS
-        // ======================================================
-        if (genderLower === "female") {
-          if (femaleRemaining <= 0) {
-            console.log("🟥 Female SOLD OUT");
-
-            fieldData = {
-              femaleicontext: "SOLD OUT!",
-              femaletextcolor: "#fc0202",
-            };
-          } else if (femaleRemaining <= 3) {
-            console.log("🟥 Female LAST FEW REMAINING");
-
-            fieldData = {
-              femaleicontext: "Last Few Remaining!",
-              femaletextcolor: "#fc0202",
-            };
-          }
-        }
-
-        // 🚫 Nothing to update
-        if (Object.keys(fieldData).length === 0) {
-          console.log("ℹ️ Ticket level normal — skipping Webflow update");
-          return;
-        }
+        const fieldData = {
+          maleicontext: maleUnavailable ? "SOLD OUT!" : "",
+          maletextcolor: maleUnavailable ? "#fc0202" : "",
+          femaleicontext: femaleUnavailable ? "SOLD OUT!" : "",
+          femaletextcolor: femaleUnavailable ? "#fc0202" : "",
+        };
 
         // 1️⃣ PATCH CMS
         await axios.patch(
