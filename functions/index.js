@@ -163,6 +163,7 @@ exports.createEventDoc = functions.https.onRequest(async (req, res) => {
 // ===============================
 
 const GENDER_TOLERANCE = 0.15; // male/female can't exceed 65% of total sales
+const MIN_SALES_FOR_RATIO_CHECK = 10; // need at least 10 tickets sold before ratio is meaningful
 
 /**
  * Computes whether male and female tickets are available based on
@@ -181,7 +182,7 @@ function computeGenderAvailability(maleSold, femaleSold, totalCapacity, toleranc
     return {maleAvailable: false, femaleAvailable: false, maleRatio: null, femaleRatio: null};
   }
 
-  if (totalSold === 0) {
+  if (maleSold < MIN_SALES_FOR_RATIO_CHECK && femaleSold < MIN_SALES_FOR_RATIO_CHECK) {
     return {maleAvailable: true, femaleAvailable: true, maleRatio: 0, femaleRatio: 0};
   }
 
@@ -225,6 +226,17 @@ detailsApp.get("/", async (req, res) => {
     const priceData = priceDoc.exists ? priceDoc.data() : null;
 
     const data = eventDoc.data();
+    const isLGBTQ = Array.isArray(data.tags) && data.tags.includes("LGBTQ");
+
+    if (isLGBTQ) {
+      return res.status(200).json({
+        success: true,
+        event: data,
+        price: priceData || null,
+        availability: {maleAvailable: true, femaleAvailable: false, isLGBTQ: true},
+      });
+    }
+
     const maleSold = (data.ticketsSold && data.ticketsSold.male) || 0;
     const femaleSold = (data.ticketsSold && data.ticketsSold.female) || 0;
     const totalCapacity =
@@ -237,7 +249,7 @@ detailsApp.get("/", async (req, res) => {
       success: true,
       event: data,
       price: priceData || null,
-      availability,
+      availability: {...availability, isLGBTQ: false},
     });
   } catch (err) {
     console.error("🔥 Error fetching event details:", err);
@@ -697,7 +709,7 @@ blinkPaylinkAppStg.post("/", async (req, res) => {
       return res.status(400).json({error: "Missing orderId"});
     }
 
-    // 🔹 Load booking draft
+    // 🔹 Load booking draft (staging collection)
     const draftRef = db.collection("lafs_booking_drafts").doc(orderId);
     const draftSnap = await draftRef.get();
 
@@ -761,8 +773,8 @@ blinkPaylinkAppStg.post("/", async (req, res) => {
             transaction_unique: `${sanitizeForBlink(draft.eventData.eventName)} Ticket`,
             merchant_data: JSON.stringify(merchantData),
             redirect_url: "https://love-at-first-sign.webflow.io/success",
-            notification_url:
-            "https://love-at-first-sign.webflow.io/success",
+            // TODO: update this URL after first deploy of stagingBlinkWebhook
+            notification_url: "https://stagingblinkwebhook-xmismu3jga-uc.a.run.app",
           }),
         },
     );
@@ -1164,7 +1176,7 @@ exports.blinkWebhook = functions.https.onRequest(async (req, res) => {
     console.log("🔥 Ticket counters updated");
 
     // ======================================================
-    // 🟥 UPDATE WEBFLOW CMS (SOLD OUT / LAST FEW REMAINING)
+    // 🟥 UPDATE WEBFLOW CMS (SOLD OUT / RATIO LOCKED)
     // ======================================================
     try {
       const webflowHeaders = {
@@ -1196,18 +1208,31 @@ exports.blinkWebhook = functions.https.onRequest(async (req, res) => {
           return;
         }
 
-        const {maleAvailable, femaleAvailable} = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
+        const isLGBTQ = Array.isArray(latest.tags) && latest.tags.includes("LGBTQ");
 
-        const maleUnavailable = maleRemaining <= 0 || !maleAvailable;
-        const femaleUnavailable = femaleRemaining <= 0 || !femaleAvailable;
+        const maleCapacityFull = maleRemaining <= 0;
+        const femaleCapacityFull = femaleRemaining <= 0;
 
-        console.log("🎟️ Availability:", {maleUnavailable, femaleUnavailable});
+        let maleRatioLocked = false;
+        let femaleRatioLocked = false;
+
+        if (isLGBTQ) {
+          femaleRatioLocked = true;
+        } else {
+          const {maleAvailable, femaleAvailable} = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
+          maleRatioLocked = !maleCapacityFull && !maleAvailable;
+          femaleRatioLocked = !femaleCapacityFull && !femaleAvailable;
+        }
+
+        console.log("🎟️ Availability:", {
+          maleCapacityFull, maleRatioLocked, femaleCapacityFull, femaleRatioLocked,
+        });
 
         const fieldData = {
-          maleicontext: maleUnavailable ? "SOLD OUT!" : "",
-          maletextcolor: maleUnavailable ? "#fc0202" : "",
-          femaleicontext: femaleUnavailable ? "SOLD OUT!" : "",
-          femaletextcolor: femaleUnavailable ? "#fc0202" : "",
+          maleicontext: maleCapacityFull ? "SOLD OUT!" : maleRatioLocked ? "Tickets paused" : "",
+          maletextcolor: maleCapacityFull ? "#fc0202" : maleRatioLocked ? "#6f6f6f" : "",
+          femaleicontext: femaleCapacityFull ? "SOLD OUT!" : femaleRatioLocked ? "Tickets paused" : "",
+          femaletextcolor: femaleCapacityFull ? "#fc0202" : femaleRatioLocked ? "#6f6f6f" : "",
         };
 
         // 1️⃣ PATCH CMS
@@ -1567,3 +1592,512 @@ saveBookingApp.post("/", async (req, res) => {
 });
 
 exports.saveBookingDraft = functions.https.onRequest(saveBookingApp);
+
+// ===============================
+// 🧪 STAGING: Get Event Details (with gender availability)
+// ===============================
+const stagingDetailsApp = express();
+
+applyCors(stagingDetailsApp, ["GET"]);
+
+stagingDetailsApp.get("/", async (req, res) => {
+  try {
+    const slug = req.query.slug;
+
+    if (!slug) {
+      return res.status(400).json({success: false, error: "Missing slug"});
+    }
+
+    const eventRef = db.collection("lafs_events_2").doc(slug);
+    const eventDoc = await eventRef.get();
+
+    if (!eventDoc.exists) {
+      return res.status(404).json({success: false, error: "Event not found"});
+    }
+
+    const priceId = req.query.priceId || "1";
+    const priceDoc = await eventRef.collection("prices").doc(priceId).get();
+    const priceData = priceDoc.exists ? priceDoc.data() : null;
+
+    const data = eventDoc.data();
+    const isLGBTQ = Array.isArray(data.tags) && data.tags.includes("LGBTQ");
+
+    if (isLGBTQ) {
+      return res.status(200).json({
+        success: true,
+        event: data,
+        price: priceData || null,
+        availability: {maleAvailable: true, femaleAvailable: false, isLGBTQ: true},
+      });
+    }
+
+    const maleSold = (data.ticketsSold && data.ticketsSold.male) || 0;
+    const femaleSold = (data.ticketsSold && data.ticketsSold.female) || 0;
+    const totalCapacity =
+      ((data.ticketPerGender && data.ticketPerGender.male) || 0) +
+      ((data.ticketPerGender && data.ticketPerGender.female) || 0);
+
+    const availability = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
+
+    return res.status(200).json({
+      success: true,
+      event: data,
+      price: priceData || null,
+      availability: {...availability, isLGBTQ: false},
+    });
+  } catch (err) {
+    console.error("🔥 [STAGING] Error fetching event details:", err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
+exports.stagingGetEventDetails = functions.https.onRequest(stagingDetailsApp);
+
+// ===============================
+// 🧪 STAGING: Blink Webhook (with gender ratio availability)
+// ===============================
+exports.stagingBlinkWebhook = functions.https.onRequest(async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      return res.status(405).send("Method Not Allowed");
+    }
+
+    const payload = req.body || {};
+    console.log("📥 [STAGING] Blink webhook received:", JSON.stringify(payload, null, 2));
+
+    const {
+      status,
+      transaction_id: transactionId,
+      paylink_id: paylinkId,
+    } = payload;
+
+    if (status !== "Paid") {
+      console.log("ℹ️ [STAGING] Payment not Paid, ignoring:", status);
+      return res.status(200).send("OK");
+    }
+
+    if (!paylinkId) {
+      console.warn("⚠️ [STAGING] Missing paylinkId");
+      return res.status(200).send("OK");
+    }
+
+    // Get access token (staging credentials)
+    const tokenResp = await fetch(BLINK_URL + "/api/pay/v1/tokens", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${BLINK_SECRET_KEY_STG}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        "api_key": BLINK_API_KEY_STG,
+        "secret_key": BLINK_SECRET_KEY_STG,
+        "send_blink_receipt": true,
+        "address_postcode_required": true,
+        "enable_moto_payments": true,
+        "application_name": "Love at First Sign",
+        "source_site": "https://www.loveatfirstsign.co.uk/",
+      }),
+    });
+
+    const tokenData = await tokenResp.json();
+    if (!tokenResp.ok) {
+      console.error("❌ [STAGING] Blink create access token failed:", tokenData);
+      return res.status(tokenResp.status).json({error: tokenData.message || "Blink error", details: tokenData});
+    }
+
+    const accessToken = tokenData.access_token;
+
+    const paylinkResp = await fetch(
+        `${BLINK_URL}/api/paylink/v1/paylinks/${paylinkId}`,
+        {
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+        },
+    );
+
+    const paylinkDetails = await paylinkResp.json();
+    console.log("ℹ️ [STAGING] paylinkDetails:", paylinkDetails);
+
+    if (!paylinkResp.ok) {
+      console.error("❌ [STAGING] Failed to fetch paylink:", paylinkDetails);
+      return res.status(200).send("OK");
+    }
+
+    const rawMerchantData = paylinkDetails.merchant_data;
+
+    let merchantData = null;
+
+    if (typeof rawMerchantData === "string") {
+      try {
+        merchantData = JSON.parse(rawMerchantData);
+      } catch (err) {
+        console.error("❌ [STAGING] Failed to parse merchant_data string:", rawMerchantData);
+      }
+    } else if (typeof rawMerchantData === "object" && rawMerchantData !== null) {
+      merchantData = rawMerchantData;
+    } else {
+      console.warn("⚠️ [STAGING] merchant_data missing or invalid", rawMerchantData);
+    }
+
+    const orderId = merchantData.orderId;
+    if (!orderId) {
+      console.error("❌ [STAGING] orderId missing in merchant_data");
+      return res.status(200).send("OK");
+    }
+
+    const draftRef = db.collection("lafs_booking_drafts").doc(orderId);
+
+    let draftData = null;
+
+    const alreadyProcessed = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(draftRef);
+
+      if (!snap.exists) {
+        console.warn("⚠️ [STAGING] Draft not found:", orderId);
+        return true;
+      }
+
+      const draft = snap.data();
+      draftData = draft;
+
+      if (draft.status === "paid") {
+        return true;
+      }
+
+      tx.update(draftRef, {
+        status: "paid",
+        transactionId: transactionId || null,
+        paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return false;
+    });
+
+    if (alreadyProcessed) {
+      console.log("⚠️ [STAGING] Duplicate or invalid webhook:", orderId);
+      return res.status(200).send("OK");
+    }
+
+    console.log("✅ [STAGING] Draft locked & marked as PAID:", orderId);
+
+    const {
+      eventData = {},
+      purchaseData = {},
+      userDetails = {},
+    } = draftData;
+
+    const {slug = ""} = eventData;
+
+    const {
+      priceId = "",
+      quantity = 1,
+    } = purchaseData;
+
+    const {
+      name = "",
+      email = "",
+      phone = "",
+      gender = "",
+    } = userDetails;
+
+    await db.collection("lafs_bookings_staging").doc(orderId).set({
+      eventData,
+      purchaseData: {
+        ...purchaseData,
+        orderId,
+        paymentChannel: "blink",
+      },
+      userDetails: {
+        name,
+        email,
+        phone,
+        gender,
+      },
+      transactionId: transactionId || "",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log("🔥 [STAGING] Booking saved:", orderId);
+
+    // Update ticket counters on real event doc
+    const eventRef = db.collection("lafs_events_2").doc(slug);
+
+    let totalSold = quantity;
+    if (priceId === "2") {
+      totalSold = quantity * 2;
+    }
+
+    const genderField =
+      gender.toLowerCase() === "male"
+        ? "ticketsSold.male"
+        : "ticketsSold.female";
+
+    await eventRef.update({
+      totalSold: admin.firestore.FieldValue.increment(totalSold),
+      [genderField]: admin.firestore.FieldValue.increment(totalSold),
+    });
+
+    console.log("🔥 [STAGING] Ticket counters updated");
+
+    // Update Webflow CMS with gender ratio availability
+    try {
+      const webflowHeaders = {
+        "Authorization": `Bearer ${WEBFLOW_TOKEN}`,
+        "Content-Type": "application/json",
+      };
+
+      const eventSnap = await eventRef.get();
+
+      if (!eventSnap.exists) {
+        console.warn("⚠️ [STAGING] Event doc missing, cannot check ticket status");
+      } else {
+        const latest = eventSnap.data();
+
+        const maleSold = (latest.ticketsSold && latest.ticketsSold.male) || 0;
+        const femaleSold = (latest.ticketsSold && latest.ticketsSold.female) || 0;
+        const maleCapacity = (latest.ticketPerGender && latest.ticketPerGender.male) || 0;
+        const femaleCapacity = (latest.ticketPerGender && latest.ticketPerGender.female) || 0;
+        const totalCapacity = maleCapacity + femaleCapacity;
+
+        const maleRemaining = maleCapacity - maleSold;
+        const femaleRemaining = femaleCapacity - femaleSold;
+
+        console.log("🎟️ [STAGING] Remaining:", {maleRemaining, femaleRemaining});
+
+        const webflowItemId = latest.eventId;
+        if (!webflowItemId) {
+          console.warn("⚠️ [STAGING] Missing eventId (Webflow item ID)");
+          return;
+        }
+
+        const isLGBTQ = Array.isArray(latest.tags) && latest.tags.includes("LGBTQ");
+
+        const maleCapacityFull = maleRemaining <= 0;
+        const femaleCapacityFull = femaleRemaining <= 0;
+
+        let maleRatioLocked = false;
+        let femaleRatioLocked = false;
+
+        if (isLGBTQ) {
+          femaleRatioLocked = true;
+        } else {
+          const {maleAvailable, femaleAvailable} = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
+          maleRatioLocked = !maleCapacityFull && !maleAvailable;
+          femaleRatioLocked = !femaleCapacityFull && !femaleAvailable;
+        }
+
+        // const maleUnavailable = maleCapacityFull || maleRatioLocked;
+        // const femaleUnavailable = femaleCapacityFull || femaleRatioLocked;
+
+        console.log("🎟️ [STAGING] Availability:", {
+          maleCapacityFull, maleRatioLocked, femaleCapacityFull, femaleRatioLocked,
+        });
+
+        const fieldData = {
+          maleicontext: maleCapacityFull ? "SOLD OUT!" : maleRatioLocked ? "Tickets paused" : "",
+          maletextcolor: maleCapacityFull ? "#fc0202" : maleRatioLocked ? "#6f6f6f" : "",
+          femaleicontext: femaleCapacityFull ? "SOLD OUT!" : femaleRatioLocked ? "Tickets paused" : "",
+          femaletextcolor: femaleCapacityFull ? "#fc0202" : femaleRatioLocked ? "#6f6f6f" : "",
+        };
+
+        await axios.patch(
+            `https://api.webflow.com/v2/collections/${WEBFLOW_COLLECTION_ID}/items/${webflowItemId}`,
+            {fieldData},
+            {headers: webflowHeaders},
+        );
+
+        console.log("🟦 [STAGING] Webflow CMS updated:", fieldData);
+
+        await axios.post(
+            `https://api.webflow.com/v2/collections/${WEBFLOW_COLLECTION_ID}/items/publish`,
+            {itemIds: [webflowItemId]},
+            {headers: webflowHeaders},
+        );
+
+        console.log("🚀 [STAGING] Webflow item published");
+      }
+    } catch (err) {
+      console.error(
+          "❌ [STAGING] Webflow ticket status update failed:",
+          err.response.data || err.message,
+      );
+    }
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error("❌ [STAGING] Blink webhook error:", err);
+    return res.status(500).send("Webhook Error");
+  }
+});
+
+// ===============================
+// 🖊️ Add Manual Purchase (Admin)
+// Called from the admin app when a third-party purchase needs to be
+// recorded. Increments ticket counters and updates Webflow CMS.
+// ===============================
+exports.addManualPurchase = functions.https.onCall(async (data) => {
+  const payload = data && data.data ? data.data : data;
+  const {
+    slug,
+    name = "",
+    email = "",
+    phone = "",
+    gender,
+    quantity,
+    source = "",
+    includeUserDetails = false,
+  } = payload;
+
+  if (!slug || !gender || !quantity) {
+    const missing = [!slug && "slug", !gender && "gender", !quantity && "quantity"].filter(Boolean);
+    throw new functions.https.HttpsError(
+        "invalid-argument",
+        `Missing required fields: ${missing.join(", ")} — received: slug=${JSON.stringify(slug)}, gender=${JSON.stringify(gender)}, quantity=${JSON.stringify(quantity)}`,
+    );
+  }
+
+  if (includeUserDetails && (!name || !email)) {
+    throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Missing required fields when includeUserDetails is true: name, email",
+    );
+  }
+
+  const normalizedGender = gender.toLowerCase();
+  if (!["male", "female"].includes(normalizedGender)) {
+    throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Invalid gender value — must be 'male' or 'female'",
+    );
+  }
+
+  const qty = Math.max(1, Number(quantity));
+  const orderId = `manual_${slug}_${Date.now()}`;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  const eventRef = db.collection("lafs_events_2").doc(slug);
+  const eventSnap = await eventRef.get();
+
+  if (!eventSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Event not found");
+  }
+
+  const eventDocData = eventSnap.data();
+
+  // ── 1. Save booking record ──────────────────────────────────────────
+  await db.collection("lafs_bookings").doc(orderId).set({
+    eventData: {
+      slug,
+      eventId: eventDocData.eventId || "",
+      eventName: eventDocData.eventName || "",
+      eventDate: eventDocData.formattedEventDate || "",
+      venueName: eventDocData.venueName || "",
+      venueAddress: eventDocData.venueAddress || "",
+      eventCity: eventDocData.venueCity || "",
+    },
+    purchaseData: {
+      orderId,
+      quantity: qty,
+      amount: 0,
+      currency: "GBP",
+      priceId: "1",
+      promoCode: "N/A",
+      paymentChannel: "manual",
+      source,
+    },
+    userDetails: {
+      name: includeUserDetails ? name : "",
+      email: includeUserDetails ? email : "",
+      phone: includeUserDetails ? phone : "",
+      gender: normalizedGender,
+    },
+    transactionId: "",
+    createdAt: now,
+  });
+
+  // ── 2. Increment ticket counters ────────────────────────────────────
+  const genderField =
+    normalizedGender === "male" ? "ticketsSold.male" : "ticketsSold.female";
+
+  await eventRef.update({
+    totalSold: admin.firestore.FieldValue.increment(qty),
+    [genderField]: admin.firestore.FieldValue.increment(qty),
+  });
+
+  console.log(`✅ Manual purchase saved: ${orderId} — ${qty} ${normalizedGender} ticket(s) for ${slug}`);
+
+  // ── 3. Update Webflow CMS ───────────────────────────────────────────
+  try {
+    const updatedSnap = await eventRef.get();
+    const latest = updatedSnap.data();
+
+    const maleSold = (latest.ticketsSold && latest.ticketsSold.male) || 0;
+    const femaleSold = (latest.ticketsSold && latest.ticketsSold.female) || 0;
+    const maleCapacity = (latest.ticketPerGender && latest.ticketPerGender.male) || 0;
+    const femaleCapacity = (latest.ticketPerGender && latest.ticketPerGender.female) || 0;
+    const totalCapacity = maleCapacity + femaleCapacity;
+
+    const webflowItemId = latest.eventId;
+    if (!webflowItemId) {
+      console.warn("⚠️ Missing eventId (Webflow item ID), skipping Webflow update");
+      return {success: true, orderId};
+    }
+
+    const maleCapacityFull = (maleCapacity - maleSold) <= 0;
+    const femaleCapacityFull = (femaleCapacity - femaleSold) <= 0;
+
+    const isLGBTQ = Array.isArray(latest.tags) && latest.tags.includes("LGBTQ");
+
+    let maleRatioLocked = false;
+    let femaleRatioLocked = false;
+
+    if (isLGBTQ) {
+      femaleRatioLocked = true;
+    } else {
+      const {maleAvailable, femaleAvailable} = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
+      maleRatioLocked = !maleCapacityFull && !maleAvailable;
+      femaleRatioLocked = !femaleCapacityFull && !femaleAvailable;
+    }
+
+    // const maleUnavailable = maleCapacityFull || maleRatioLocked;
+    // const femaleUnavailable = femaleCapacityFull || femaleRatioLocked;
+
+    const fieldData = {
+      maleicontext: maleCapacityFull ? "SOLD OUT!" : maleRatioLocked ? "Tickets paused" : "",
+      maletextcolor: maleCapacityFull ? "#fc0202" : maleRatioLocked ? "#6f6f6f" : "",
+      femaleicontext: femaleCapacityFull ? "SOLD OUT!" : femaleRatioLocked ? "Tickets paused" : "",
+      femaletextcolor: femaleCapacityFull ? "#fc0202" : femaleRatioLocked ? "#6f6f6f" : "",
+    };
+
+    const webflowHeaders = {
+      "Authorization": `Bearer ${WEBFLOW_TOKEN}`,
+      "Content-Type": "application/json",
+    };
+
+    await axios.patch(
+        `https://api.webflow.com/v2/collections/${WEBFLOW_COLLECTION_ID}/items/${webflowItemId}`,
+        {fieldData},
+        {headers: webflowHeaders},
+    );
+
+    await axios.post(
+        `https://api.webflow.com/v2/collections/${WEBFLOW_COLLECTION_ID}/items/publish`,
+        {itemIds: [webflowItemId]},
+        {headers: webflowHeaders},
+    );
+
+    console.log("🟦 Webflow CMS updated for manual purchase:", fieldData);
+  } catch (err) {
+    console.error(
+        "❌ Webflow update failed for manual purchase:",
+        err.response && err.response.data || err.message,
+    );
+    // Non-critical — booking and counters are already updated.
+  }
+
+  return {success: true, orderId};
+});
