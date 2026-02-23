@@ -240,8 +240,8 @@ detailsApp.get("/", async (req, res) => {
     const maleSold = (data.ticketsSold && data.ticketsSold.male) || 0;
     const femaleSold = (data.ticketsSold && data.ticketsSold.female) || 0;
     const totalCapacity =
-      ((data.ticketPerGender && data.ticketPerGender.male) || 0) +
-      ((data.ticketPerGender && data.ticketPerGender.female) || 0);
+      ((data.ticketPerGender && data.ticketPerGender.male) || 15) +
+      ((data.ticketPerGender && data.ticketPerGender.female) || 15);
 
     const availability = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
 
@@ -1193,8 +1193,8 @@ exports.blinkWebhook = functions.https.onRequest(async (req, res) => {
 
         const maleSold = (latest.ticketsSold && latest.ticketsSold.male) || 0;
         const femaleSold = (latest.ticketsSold && latest.ticketsSold.female) || 0;
-        const maleCapacity = (latest.ticketPerGender && latest.ticketPerGender.male) || 0;
-        const femaleCapacity = (latest.ticketPerGender && latest.ticketPerGender.female) || 0;
+        const maleCapacity = (latest.ticketPerGender && latest.ticketPerGender.male) || 15;
+        const femaleCapacity = (latest.ticketPerGender && latest.ticketPerGender.female) || 15;
         const totalCapacity = maleCapacity + femaleCapacity;
 
         const maleRemaining = maleCapacity - maleSold;
