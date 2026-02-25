@@ -109,24 +109,40 @@ exports.createEventDoc = functions.https.onRequest(async (req, res) => {
     // ===============================
     const pricesCollection = docRef.collection("prices");
 
-    const discountedPrice = Number(eventData.price);
+    const basePrice = Number(eventData.price);
     const discountPercent = 0.2; // 20% discount
+    const skipEarlyBirdPromo = !!eventData.skipEarlyBirdPromo;
 
-    const undiscountedPrice = Math.round(
-        discountedPrice / (1 - discountPercent),
-    );
-
-    // 🟩 Price 1 — Always created
+    // 🟩 Price 1
     if (eventData.price) {
-      await pricesCollection.doc("1").set(
-          {
-            price: discountedPrice,
-            undiscounted_price: undiscountedPrice,
-            tag: "Early Bird", // optional label
-            updatedAt: now,
-          },
-          {merge: true},
-      );
+      // ===============================
+      // 🚫 SKIP EARLY BIRD
+      // ===============================
+      if (skipEarlyBirdPromo) {
+        await pricesCollection.doc("1").set(
+            {
+              price: basePrice,
+              undiscounted_price: basePrice,
+              tag: "", // no early bird label
+              updatedAt: now,
+            },
+            {merge: true},
+        );
+      } else {
+        const undiscountedPrice = Math.round(
+            basePrice / (1 - discountPercent),
+        );
+
+        await pricesCollection.doc("1").set(
+            {
+              price: basePrice,
+              undiscounted_price: undiscountedPrice,
+              tag: "Early Bird",
+              updatedAt: now,
+            },
+            {merge: true},
+        );
+      }
     }
 
     // 🟦 Price 2 — Only if provided
