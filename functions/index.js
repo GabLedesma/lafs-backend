@@ -637,7 +637,7 @@ bookingDraftApp.post("/", async (req, res) => {
       eventData = {},
       purchaseData = {},
       userDetails = {},
-      paymentProvider = "blink-paylink",
+      paymentProvider = "blink",
     } = req.body || {};
 
     if (!orderId) {
@@ -711,6 +711,37 @@ bookingDraftApp.post("/", async (req, res) => {
 exports.createBookingDraft = functions.https.onRequest(bookingDraftApp);
 
 // ===============================
+// 🔗 Update Booking Draft with Intent ID (Staging)
+// ===============================
+
+const updateBookingDraftStgApp = express();
+
+applyCors(updateBookingDraftStgApp, ["POST"]);
+updateBookingDraftStgApp.use(express.json());
+
+updateBookingDraftStgApp.post("/", async (req, res) => {
+  try {
+    const {orderId, intentId} = req.body || {};
+
+    if (!orderId || !intentId) {
+      return res.status(400).json({success: false, error: "Missing orderId or intentId"});
+    }
+
+    await db.collection("lafs_booking_drafts").doc(orderId).update({
+      paymentIntentId: intentId,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return res.status(200).json({success: true});
+  } catch (err) {
+    console.error("🔥 updateBookingDraftStg error:", err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
+exports.updateBookingDraftStg = functions.https.onRequest(updateBookingDraftStgApp);
+
+// ===============================
 // 🔹 Create Blink Paylink STAGING
 // ===============================
 const blinkPaylinkAppStg = express();
@@ -763,6 +794,12 @@ blinkPaylinkAppStg.post("/", async (req, res) => {
 
     const merchantData = {
       orderId,
+      eventName: draft.eventData.eventName || "",
+      eventDate: draft.eventData.eventDate || "",
+      eventStartTime: "19:00",
+      venueName: draft.eventData.venueName || "",
+      venueAddress: draft.eventData.venueAddress || "",
+      eventCity: draft.eventData.eventCity || "",
     };
 
     // 🔹 Create Blink Paylink
@@ -1095,6 +1132,7 @@ exports.blinkWebhook = functions.https.onRequest(async (req, res) => {
     const {
       slug = "",
       eventId = "",
+      eventName = "",
       eventDate = "",
       venueName = "",
       venueAddress = "",
@@ -1155,6 +1193,7 @@ exports.blinkWebhook = functions.https.onRequest(async (req, res) => {
             gender,
             name,
             eventId,
+            eventName,
             eventDate,
             phone,
             venueName,
@@ -1310,6 +1349,291 @@ exports.blinkWebhook = functions.https.onRequest(async (req, res) => {
     return res.status(200).send("OK");
   } catch (err) {
     console.error("❌ Blink webhook error:", err);
+    return res.status(500).send("Webhook Error");
+  }
+});
+
+// ===============================
+// 🔔 Blink Intent Webhook (Staging)
+// ===============================
+exports.blinkIntentWebhookStg = functions.https.onRequest(async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      return res.status(405).send("Method Not Allowed");
+    }
+
+    const payload = req.body || {};
+    console.log("📥 [STG] Blink intent webhook received:", JSON.stringify(payload, null, 2));
+
+    const {
+      status,
+      transaction_id: transactionId,
+      intent_id: intentId,
+      orderId: payloadOrderId,
+    } = payload;
+
+    if (status !== "success" && status !== "Paid" && status !== "captured") {
+      console.log("ℹ️ [STG] Payment not successful, ignoring:", status);
+      return res.status(200).send("OK");
+    }
+
+    if (!intentId && !payloadOrderId) {
+      console.warn("⚠️ [STG] Missing both intent_id and orderId");
+      return res.status(200).send("OK");
+    }
+
+    // Look up draft — prefer direct orderId lookup, fall back to paymentIntentId search
+    let draftDoc;
+    if (payloadOrderId) {
+      const directRef = db.collection("lafs_booking_drafts").doc(payloadOrderId);
+      const snap = await directRef.get();
+      if (!snap.exists) {
+        console.warn("⚠️ [STG] No draft found for orderId:", payloadOrderId);
+        return res.status(200).send("OK");
+      }
+      draftDoc = snap;
+    } else {
+      const snap = await db.collection("lafs_booking_drafts")
+          .where("paymentIntentId", "==", intentId)
+          .limit(1)
+          .get();
+      if (snap.empty) {
+        console.warn("⚠️ [STG] No draft found for intentId:", intentId);
+        return res.status(200).send("OK");
+      }
+      draftDoc = snap.docs[0];
+    }
+
+    const orderId = payloadOrderId || draftDoc.id;
+    const draftRef = draftDoc.ref;
+
+    let draftData = null;
+
+    // ======================================================
+    // 🔒 IDEMPOTENCY + FETCH DRAFT (ATOMIC)
+    // ======================================================
+    const alreadyProcessed = await db.runTransaction(async (tx) => {
+      const docSnap = await tx.get(draftRef);
+
+      if (!docSnap.exists) {
+        console.warn("⚠️ [STG] Draft not found:", orderId);
+        return true;
+      }
+
+      const draft = docSnap.data();
+      draftData = draft;
+
+      if (draft.status === "paid") {
+        return true;
+      }
+
+      tx.update(draftRef, {
+        status: "paid",
+        transactionId: transactionId || null,
+        paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return false;
+    });
+
+    if (alreadyProcessed) {
+      console.log("⚠️ [STG] Duplicate or invalid webhook:", orderId);
+      return res.status(200).send("OK");
+    }
+
+    console.log("✅ [STG] Draft locked & marked as PAID:", orderId);
+
+    // ======================================================
+    // 📦 EXTRACT DATA FROM DRAFT
+    // ======================================================
+    const {
+      eventData = {},
+      purchaseData = {},
+      userDetails = {},
+    } = draftData;
+
+    const {
+      slug = "",
+      eventId = "",
+      eventName = "",
+      eventDate = "",
+      venueName = "",
+      venueAddress = "",
+      eventCity = "",
+    } = eventData;
+
+    const {
+      priceId = "",
+      quantity = 1,
+      promoCode = "",
+      amount = 0,
+    } = purchaseData;
+
+    const {
+      name = "",
+      email = "",
+      phone = "",
+      gender = "",
+    } = userDetails;
+
+    // ======================================================
+    // 💾 SAVE TO lafs_bookings
+    // ======================================================
+    await db.collection("lafs_bookings").doc(orderId).set({
+      eventData,
+      purchaseData: {
+        ...purchaseData,
+        orderId,
+        paymentChannel: "blink-intent",
+      },
+      userDetails: {name, email, phone, gender},
+      transactionId: transactionId || "",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log("🔥 [STG] Booking saved:", orderId);
+
+    // ======================================================
+    // 📨 NOTIFY MAKE.COM
+    // ======================================================
+    try {
+      await fetch("https://hook.eu2.make.com/sk87zd5qeekdh6580bgqffjgwo3s625f", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          type: "blink_payment_success",
+          orderId,
+          amount,
+          email,
+          metadata: {email, slug, gender, name, eventId, eventName, eventDate, phone, venueName, venueAddress, eventCity},
+        }),
+      });
+      console.log("📨 [STG] Sent data to Make.com");
+    } catch (err) {
+      console.error("❌ [STG] Failed to send to Make.com:", err);
+    }
+
+    // ======================================================
+    // 🎟️ UPDATE EVENT TICKET COUNTERS
+    // ======================================================
+    const eventRef = db.collection("lafs_events_2").doc(slug);
+
+    let totalSold = quantity;
+    if (priceId === "2") {
+      totalSold = quantity * 2;
+    }
+
+    const genderField = gender.toLowerCase() === "male" ? "ticketsSold.male" : "ticketsSold.female";
+
+    await eventRef.update({
+      totalSold: admin.firestore.FieldValue.increment(totalSold),
+      [genderField]: admin.firestore.FieldValue.increment(totalSold),
+    });
+
+    console.log("🔥 [STG] Ticket counters updated");
+
+    // ======================================================
+    // 🟥 UPDATE WEBFLOW CMS
+    // ======================================================
+    try {
+      const webflowHeaders = {
+        "Authorization": `Bearer ${WEBFLOW_TOKEN}`,
+        "Content-Type": "application/json",
+      };
+
+      const eventSnap = await eventRef.get();
+
+      if (!eventSnap.exists) {
+        console.warn("⚠️ [STG] Event doc missing, cannot check ticket status");
+      } else {
+        const latest = eventSnap.data();
+
+        const maleSold = (latest.ticketsSold && latest.ticketsSold.male) || 0;
+        const femaleSold = (latest.ticketsSold && latest.ticketsSold.female) || 0;
+        const maleCapacity = (latest.ticketPerGender && latest.ticketPerGender.male) || 15;
+        const femaleCapacity = (latest.ticketPerGender && latest.ticketPerGender.female) || 15;
+        const totalCapacity = maleCapacity + femaleCapacity;
+
+        const maleRemaining = maleCapacity - maleSold;
+        const femaleRemaining = femaleCapacity - femaleSold;
+
+        const webflowItemId = latest.eventId;
+        if (!webflowItemId) {
+          console.warn("⚠️ [STG] Missing eventId (Webflow item ID)");
+        } else {
+          const isLGBTQ = Array.isArray(latest.tags) && latest.tags.includes("LGBTQ");
+
+          const maleCapacityFull = maleRemaining <= 0;
+          const femaleCapacityFull = femaleRemaining <= 0;
+
+          let maleRatioLocked = false;
+          let femaleRatioLocked = false;
+
+          if (isLGBTQ) {
+            femaleRatioLocked = true;
+          } else {
+            const {maleAvailable, femaleAvailable} = computeGenderAvailability(maleSold, femaleSold, totalCapacity);
+            maleRatioLocked = !maleCapacityFull && !maleAvailable;
+            femaleRatioLocked = !femaleCapacityFull && !femaleAvailable;
+          }
+
+          const fieldData = {
+            maleicontext: maleCapacityFull ? "SOLD OUT!" : maleRatioLocked ? "Tickets paused" : "",
+            maletextcolor: maleCapacityFull ? "#fc0202" : maleRatioLocked ? "#6f6f6f" : "",
+            femaleicontext: femaleCapacityFull ? "SOLD OUT!" : femaleRatioLocked ? "Tickets paused" : "",
+            femaletextcolor: femaleCapacityFull ? "#fc0202" : femaleRatioLocked ? "#6f6f6f" : "",
+          };
+
+          await axios.patch(
+              `https://api.webflow.com/v2/collections/${WEBFLOW_COLLECTION_ID}/items/${webflowItemId}`,
+              {fieldData},
+              {headers: webflowHeaders},
+          );
+          console.log("🟦 [STG] Webflow CMS updated:", fieldData);
+
+          await axios.post(
+              `https://api.webflow.com/v2/collections/${WEBFLOW_COLLECTION_ID}/items/publish`,
+              {itemIds: [webflowItemId]},
+              {headers: webflowHeaders},
+          );
+          console.log("🚀 [STG] Webflow item published");
+        }
+      }
+    } catch (err) {
+      console.error("❌ [STG] Webflow ticket status update failed:", err.response && err.response.data || err.message);
+    }
+
+    // ======================================================
+    // 🎟️ PROMO CODE USAGE TRACKING
+    // ======================================================
+    if (promoCode && promoCode !== "N/A") {
+      const promoRef = db.collection("lafs_promo_codes").doc(promoCode);
+      const claimRef = promoRef.collection("claims").doc(orderId);
+
+      await db.runTransaction(async (tx) => {
+        const claimSnap = await tx.get(claimRef);
+        if (claimSnap.exists) return;
+
+        tx.set(claimRef, {
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          eventId,
+          slug,
+          purchaseData,
+        });
+
+        tx.set(promoRef, {
+          uses: admin.firestore.FieldValue.increment(quantity),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+      });
+
+      console.log(`🎟️ [STG] Promo ${promoCode} incremented by ${quantity}`);
+    }
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error("❌ [STG] Blink intent webhook error:", err);
     return res.status(500).send("Webhook Error");
   }
 });
